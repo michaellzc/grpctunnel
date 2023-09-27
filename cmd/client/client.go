@@ -40,7 +40,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
+	"net"
 	"sync"
 	"time"
 
@@ -165,6 +165,12 @@ func run(ctx context.Context, conf config) error {
 		return ok
 	}
 
+	serverL, err := net.Listen("tcp", "localhost:8081")
+	if err != nil {
+		return fmt.Errorf("failed to listen on localhost:8081: %v", err)
+	}
+	defer serverL.Close()
+
 	// Dial the target with retry.
 	go func() {
 		bo := getBackOff()
@@ -174,21 +180,29 @@ func run(ctx context.Context, conf config) error {
 			time.Sleep(wait)
 		}
 
-		session, err := client.NewSession(dialTarget)
-		if err != nil {
-			log.Printf("error from new session: %v", err)
-			errCh <- err
-			return
-		}
-		log.Printf("new session established for target: %s\n", dialTarget)
+		for {
+			// Listen for an incoming connection.
+			conn, err := serverL.Accept()
+			if err != nil {
+				fmt.Println("Error accepting: ", err.Error())
+				return
+			}
 
-		// Once a tunnel session is established, it connects it to a stdio.
-		stdio := &stdIOConn{Reader: os.Stdin, WriteCloser: os.Stdout}
-		if err = bidi.Copy(session, stdio); err != nil {
-			log.Printf("error from bidi copy: %v\n", err)
-			return
+			// Handle connections in a new goroutine.
+			go func() {
+				session, err := client.NewSession(dialTarget)
+				if err != nil {
+					log.Printf("error from new session: %v", err)
+					errCh <- err
+					return
+				}
+				log.Printf("new session established for target: %s\n", dialTarget)
+				if err = bidi.Copy(session, conn); err != nil {
+					log.Printf("error from bidi copy: %v\n", err)
+					return
+				}
+			}()
 		}
-
 	}()
 
 	// Listen for any request to create a new session.
