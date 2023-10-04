@@ -527,6 +527,13 @@ func (s *Server) subscribe(addr net.Addr, sub *tpb.Subscription) error {
 		allTypes[t.Type] = struct{}{}
 	}
 
+	// this handles the case with the following startup order
+	// client -> server -> agent
+	// where the target/agent is not known to the server at the time of the subscription
+	// this will prevent client to receive any updates
+	// hence we have to force the subscription to the target type regradless
+	allTypes[sub.TargetType] = struct{}{}
+
 	for typ := range allTypes {
 		if sub.TargetType != "" && sub.TargetType != typ {
 			continue
