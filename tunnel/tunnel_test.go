@@ -713,7 +713,10 @@ func TestServerTunnelSuccess(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to resolve address: %v", err)
 		}
-		i := make(chan ioOrErr)
+		// Connection channels are buffered (cap 1) so session responses can be
+		// delivered without blocking; Tunnel drops the stream if neither the
+		// buffer nor a receiver is available.
+		i := make(chan ioOrErr, 1)
 		s.addConnection(1, addr, i)
 		ctx := peer.NewContext(context.Background(), &peer.Peer{Addr: addr})
 		go func() {

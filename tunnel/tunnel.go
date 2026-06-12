@@ -815,7 +815,16 @@ func (s *Server) newClientSession(ctx context.Context, session *tpb.Session, add
 	tag := session.GetTag()
 	if session.GetError() != "" {
 		if ch := s.connection(tag, addr); ch != nil {
-			ch <- ioOrErr{err: errors.New(session.GetError())}
+			// Deliver without blocking: the waiter in handleSession may have
+			// abandoned this channel on context cancelation. A bare send here
+			// would permanently wedge this client's Register goroutine, which
+			// in turn leaks the client's target registrations even after the
+			// underlying connection dies.
+			select {
+			case ch <- ioOrErr{err: errors.New(session.GetError())}:
+			default:
+				s.sendError(fmt.Errorf("dropping session error for tag %v: no receiver: %s", tag, session.GetError()))
+			}
 			return
 		}
 		s.sendError(fmt.Errorf("no connection associated with tag: %v", tag))
@@ -843,7 +852,9 @@ func (s *Server) newClientSession(ctx context.Context, session *tpb.Session, add
 		return
 	}
 
-	retCh := make(chan ioOrErr)
+	// Buffered so a response delivered after this function abandons the wait
+	// below never blocks the sender.
+	retCh := make(chan ioOrErr, 1)
 	if err := s.addConnection(tag, addr, retCh); err != nil {
 		if err := rs.Send(&tpb.RegisterOp{Registration: &tpb.RegisterOp_Session{Session: &tpb.Session{Tag: tag, Error: err.Error()}}}); err != nil {
 			s.sendError(fmt.Errorf("failed to send session error: %v", err))
@@ -864,6 +875,17 @@ func (s *Server) newClientSession(ctx context.Context, session *tpb.Session, add
 	// ctx is a child of the register stream's context
 	select {
 	case <-ctx.Done():
+		// Remove the connection so no new sender can pick it up, then drain a
+		// response that may already be buffered so its tunnel stream is
+		// released rather than leaked.
+		s.deleteConnection(tag, addr)
+		select {
+		case ioe := <-retCh:
+			if ioe.rwc != nil {
+				ioe.rwc.Close()
+			}
+		default:
+		}
 		s.sendError(ctx.Err())
 		return
 	case ioe := <-retCh:
@@ -912,7 +934,14 @@ func (s *Server) Tunnel(stream tpb.Tunnel_TunnelServer) error {
 		return errors.New("no connection associated with tag")
 	}
 	d := newIOStream(stream.Context(), stream)
-	ch <- ioOrErr{rwc: d}
+	// Deliver without blocking: the session waiter may have abandoned the
+	// channel after this handler looked it up. The channel is buffered, so a
+	// hit on the default case means another response already claimed it.
+	select {
+	case ch <- ioOrErr{rwc: d}:
+	default:
+		return fmt.Errorf("no receiver for tunnel stream with tag %d: session abandoned", tag)
+	}
 	// doneCh is the done channel created from a child context of stream.Context()
 	<-d.doneCh
 	return nil
@@ -1076,7 +1105,11 @@ func (s *Server) NewSession(ctx context.Context, ss ServerSession) (io.ReadWrite
 }
 
 func (s *Server) handleSession(ctx context.Context, tag int32, addr net.Addr, target Target, stream regStream) (_ io.ReadWriteCloser, err error) {
-	retCh := make(chan ioOrErr)
+	// Buffered so a response delivered after this function abandons the wait
+	// below (ctx canceled) never blocks the sender. The sender is the
+	// client's Register goroutine, and blocking it permanently leaks the
+	// client's target registrations even after the connection dies.
+	retCh := make(chan ioOrErr, 1)
 	if err = s.addConnection(tag, addr, retCh); err != nil {
 		return nil, fmt.Errorf("handleSession: failed to add connection: %v", err)
 	}
@@ -1096,6 +1129,18 @@ func (s *Server) handleSession(ctx context.Context, tag int32, addr net.Addr, ta
 	}
 	select {
 	case <-ctx.Done():
+		// Remove the connection so no new sender can pick it up, then drain a
+		// response that may already be buffered so its tunnel stream is
+		// released rather than leaked. The deferred deleteConnection is then
+		// a no-op.
+		s.deleteConnection(tag, addr)
+		select {
+		case ioe := <-retCh:
+			if ioe.rwc != nil {
+				ioe.rwc.Close()
+			}
+		default:
+		}
 		return nil, ctx.Err()
 	case ioe := <-retCh:
 		if ioe.err != nil {
