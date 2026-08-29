@@ -21,25 +21,44 @@ import (
 	"io"
 )
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
 // Copy starts bi-directional copying between two read write closers.
 func Copy(i, j io.ReadWriteCloser) error {
 	errCh := make(chan error, 2)
 
-	copy := func(in, out io.ReadWriteCloser) {
-		defer in.Close()
-		_, err := io.Copy(in, out)
+	copy := func(dst, src io.ReadWriteCloser) {
+		_, err := io.Copy(dst, src)
+		if err == nil || err == io.EOF {
+			if w, ok := dst.(closeWriter); ok {
+				err = w.CloseWrite()
+			} else {
+				err = dst.Close()
+			}
+		}
 		errCh <- err
 	}
 
 	go copy(i, j)
 	go copy(j, i)
 
-	err := <-errCh
-	// Explicitly ignoring the second error as it's most likely io.EOF; however,
-	// we're still waiting for the second error to ensure the go-routines have completed.
-	<-errCh
-	if err == io.EOF {
+	firstErr := <-errCh
+	if firstErr != nil && firstErr != io.EOF {
+		// A terminal error in either direction must tear down both sides. Do not
+		// wait for the second copy: returning lets an owning gRPC handler exit and
+		// cancel a Recv that cannot otherwise be interrupted from server code.
+		_ = i.Close()
+		_ = j.Close()
+		return firstErr
+	}
+
+	secondErr := <-errCh
+	_ = i.Close()
+	_ = j.Close()
+	if secondErr == io.EOF {
 		return nil
 	}
-	return err
+	return secondErr
 }

@@ -227,6 +227,16 @@ func (tc *tunnelClient) Tunnel(ctx context.Context, opts ...grpc.CallOption) (tp
 	return tc.tunStream, nil
 }
 
+type contextTunnelClient struct {
+	*tunnelClient
+	contexts chan context.Context
+}
+
+func (tc *contextTunnelClient) Tunnel(ctx context.Context, opts ...grpc.CallOption) (tpb.Tunnel_TunnelClient, error) {
+	tc.contexts <- ctx
+	return tc.tunStream, nil
+}
+
 type tunnelBlockingClient struct {
 	*tunnelClient
 	regStream tpb.Tunnel_RegisterClient
@@ -409,12 +419,41 @@ func TestDataIOStreamWrite(t *testing.T) {
 func TestDataIOStreamClose(t *testing.T) {
 	tds := &testDataStream{}
 	d := newIOStream(context.Background(), tds)
-	err := d.Close()
-	if err != nil {
-		t.Fatalf("Close() got %v, want nil", err)
+	if err := d.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite() got %v, want nil", err)
 	}
 	if !tds.data.GetClose() {
-		t.Errorf("Close() set close field to %t, want true", tds.data.GetClose())
+		t.Errorf("CloseWrite() set close field to %t, want true", tds.data.GetClose())
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close() got %v, want nil", err)
+	}
+	if _, err := d.Read(nil); err != context.Canceled {
+		t.Errorf("Read() after Close got %v, want %v", err, context.Canceled)
+	}
+}
+
+func TestClientTunnelStreamCloseCancelsRPCContext(t *testing.T) {
+	tc := &contextTunnelClient{
+		tunnelClient: &tunnelClient{tunStream: &tunnelClientStream{maxSends: 10}},
+		contexts:     make(chan context.Context, 1),
+	}
+	c, err := NewClient(tc, ClientConfig{}, map[Target]struct{}{})
+	if err != nil {
+		t.Fatalf("NewClient() failed: %v", err)
+	}
+	stream, err := c.newTunnelStream(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("newTunnelStream() failed: %v", err)
+	}
+	rpcCtx := <-tc.contexts
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	select {
+	case <-rpcCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Close() did not cancel the context that owns the gRPC tunnel stream")
 	}
 }
 
@@ -842,6 +881,9 @@ func TestServerNewSession(t *testing.T) {
 			}
 			if rwc != nil && rwc != test.ioe.rwc {
 				t.Fatalf("NewSession() want %v, got %v", test.ioe.rwc, rwc)
+			}
+			if ch := s.connection(1, addr); ch != nil {
+				t.Fatal("NewSession() retained a completed connection")
 			}
 		})
 	}
@@ -1359,6 +1401,8 @@ func TestClientNewSessionAddConnectionFailure(t *testing.T) {
 		t.Fatalf("NewClient() failed: %v", err)
 	}
 	c.addr = addr
+	c.ctx = context.Background()
+	c.rs = &regSafeStream{regStream: &registerClientStream{maxSends: 10}}
 
 	if err := c.addConnection(-1, addr, make(chan ioOrErr)); err != nil {
 		t.Fatalf("AddConnection() failed: %v", err)
@@ -1388,6 +1432,7 @@ func TestClientNewSessionSendFailure(t *testing.T) {
 			sendErr: true,
 		},
 	}
+	c.ctx = context.Background()
 	_, err = c.NewSession(Target{})
 	if err == nil {
 		t.Fatalf("NewSession() got success, wanted error: %v", err)
@@ -1413,6 +1458,7 @@ func TestClientNewSessionRetChErr(t *testing.T) {
 			streamRecv: []*tpb.RegisterOp{},
 		},
 	}
+	c.ctx = context.Background()
 	go func() {
 		var ioe chan ioOrErr
 		for ioe == nil {
@@ -1423,5 +1469,60 @@ func TestClientNewSessionRetChErr(t *testing.T) {
 	_, err = c.NewSession(Target{})
 	if err == nil {
 		t.Fatalf("NewSession() got success, wanted error: %v", err)
+	}
+}
+
+func TestClientNewSessionSuccessReleasesConnection(t *testing.T) {
+	addr, err := net.ResolveTCPAddr("tcp", "192.168.0.1:22")
+	if err != nil {
+		t.Fatalf("failed to resolve addr: %v", err)
+	}
+	c, err := NewClient(nil, ClientConfig{}, map[Target]struct{}{})
+	if err != nil {
+		t.Fatalf("NewClient() failed: %v", err)
+	}
+	c.addr = addr
+	c.ctx = context.Background()
+	c.rs = &regSafeStream{regStream: &registerClientStream{maxSends: 10}}
+
+	go func() {
+		for {
+			if ch := c.connection(-1, addr); ch != nil {
+				ch <- ioOrErr{rwc: newIOStream(context.Background(), &testDataStream{})}
+				return
+			}
+		}
+	}()
+
+	rwc, err := c.NewSession(Target{ID: "target"})
+	if err != nil {
+		t.Fatalf("NewSession() failed: %v", err)
+	}
+	defer rwc.Close()
+	if ch := c.connection(-1, addr); ch != nil {
+		t.Fatal("NewSession() retained a completed connection")
+	}
+}
+
+func TestClientNewSessionContextCancellationReleasesConnection(t *testing.T) {
+	addr, err := net.ResolveTCPAddr("tcp", "192.168.0.1:22")
+	if err != nil {
+		t.Fatalf("failed to resolve addr: %v", err)
+	}
+	c, err := NewClient(nil, ClientConfig{}, map[Target]struct{}{})
+	if err != nil {
+		t.Fatalf("NewClient() failed: %v", err)
+	}
+	c.addr = addr
+	c.ctx = context.Background()
+	c.rs = &regSafeStream{regStream: &registerClientStream{maxSends: 10}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := c.NewSessionContext(ctx, Target{ID: "target"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("NewSessionContext() got %v, want %v", err, context.Canceled)
+	}
+	if ch := c.connection(-1, addr); ch != nil {
+		t.Fatal("NewSessionContext() retained a canceled connection")
 	}
 }
