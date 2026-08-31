@@ -75,15 +75,22 @@ func (d *dataSafeStream) Send(data *tpb.Data) error {
 
 // ioStream defines a gRPC stream that implements io.ReadWriteCloser.
 type ioStream struct {
-	buf    []byte
-	doneCh <-chan struct{}
-	cancel context.CancelFunc
+	buf       []byte
+	doneCh    <-chan struct{}
+	cancel    context.CancelFunc
+	closeOnce sync.Once
 	dataSafeStream
 }
 
 // newIOStream creates and returns a stream which implements io.ReadWriteCloser.
 func newIOStream(ctx context.Context, d dataStream) *ioStream {
 	ctx, cancel := context.WithCancel(ctx)
+	return newIOStreamWithCancel(ctx, d, cancel)
+}
+
+// newIOStreamWithCancel creates an IO stream whose Close method cancels the
+// context that owns the underlying gRPC stream.
+func newIOStreamWithCancel(ctx context.Context, d dataStream, cancel context.CancelFunc) *ioStream {
 	return &ioStream{
 		dataSafeStream: dataSafeStream{
 			dataStream: d,
@@ -133,10 +140,17 @@ func (s *ioStream) Write(b []byte) (int, error) {
 	}
 }
 
-// Close implements io.Closer.
-func (s *ioStream) Close() error {
-	s.cancel()
+// CloseWrite signals that no more data will be written while leaving the read
+// direction open.
+func (s *ioStream) CloseWrite() error {
 	return s.Send(&tpb.Data{Close: true})
+}
+
+// Close implements io.Closer and terminates the context that owns the gRPC
+// stream. The cancellation is idempotent and unblocks an in-flight Recv.
+func (s *ioStream) Close() error {
+	s.closeOnce.Do(s.cancel)
+	return nil
 }
 
 // session defines a unique connection for the tunnel.
@@ -231,8 +245,8 @@ func (s *Server) bridgeRegHandler(ss ServerSession) error {
 	return nil
 }
 
-func (s *Server) bridgeHandler(ss ServerSession, rwc io.ReadWriteCloser) error {
-	ctx, cancel := context.WithCancel(context.Background())
+func (s *Server) bridgeHandler(ctx context.Context, ss ServerSession, rwc io.ReadWriteCloser) error {
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	addr := s.clientFromTarget(ss.Target)
@@ -326,18 +340,20 @@ func (s *Server) clientInfo(addr net.Addr) clientRegInfo {
 
 // clientTargets returns all the targets of a given client. If addr is nil, return all the targets.
 func (s *Server) clientTargets(addr net.Addr) map[Target]struct{} {
-	s.cmu.RLock()
-	defer s.cmu.RUnlock()
 	// Make a deep copy.
 	targets := make(map[Target]struct{})
 
 	if addr == nil {
+		s.tmu.RLock()
+		defer s.tmu.RUnlock()
 		for t := range s.rTargets {
 			targets[t] = struct{}{}
 		}
 		return targets
 	}
 
+	s.cmu.RLock()
+	defer s.cmu.RUnlock()
 	info, ok := s.clients[addr]
 	if !ok {
 		return nil
@@ -815,7 +831,16 @@ func (s *Server) newClientSession(ctx context.Context, session *tpb.Session, add
 	tag := session.GetTag()
 	if session.GetError() != "" {
 		if ch := s.connection(tag, addr); ch != nil {
-			ch <- ioOrErr{err: errors.New(session.GetError())}
+			// Deliver without blocking: the waiter in handleSession may have
+			// abandoned this channel on context cancelation. A bare send here
+			// would permanently wedge this client's Register goroutine, which
+			// in turn leaks the client's target registrations even after the
+			// underlying connection dies.
+			select {
+			case ch <- ioOrErr{err: errors.New(session.GetError())}:
+			default:
+				s.sendError(fmt.Errorf("dropping session error for tag %v: no receiver: %s", tag, session.GetError()))
+			}
 			return
 		}
 		s.sendError(fmt.Errorf("no connection associated with tag: %v", tag))
@@ -843,7 +868,9 @@ func (s *Server) newClientSession(ctx context.Context, session *tpb.Session, add
 		return
 	}
 
-	retCh := make(chan ioOrErr)
+	// Buffered so a response delivered after this function abandons the wait
+	// below never blocks the sender.
+	retCh := make(chan ioOrErr, 1)
 	if err := s.addConnection(tag, addr, retCh); err != nil {
 		if err := rs.Send(&tpb.RegisterOp{Registration: &tpb.RegisterOp_Session{Session: &tpb.Session{Tag: tag, Error: err.Error()}}}); err != nil {
 			s.sendError(fmt.Errorf("failed to send session error: %v", err))
@@ -851,6 +878,7 @@ func (s *Server) newClientSession(ctx context.Context, session *tpb.Session, add
 		}
 		return
 	}
+	defer s.deleteConnection(tag, addr)
 
 	if err := rs.Send(&tpb.RegisterOp{Registration: &tpb.RegisterOp_Session{Session: &tpb.Session{
 		Tag:        session.Tag,
@@ -864,6 +892,17 @@ func (s *Server) newClientSession(ctx context.Context, session *tpb.Session, add
 	// ctx is a child of the register stream's context
 	select {
 	case <-ctx.Done():
+		// Remove the connection so no new sender can pick it up, then drain a
+		// response that may already be buffered so its tunnel stream is
+		// released rather than leaked.
+		s.deleteConnection(tag, addr)
+		select {
+		case ioe := <-retCh:
+			if ioe.rwc != nil {
+				ioe.rwc.Close()
+			}
+		default:
+		}
 		s.sendError(ctx.Err())
 		return
 	case ioe := <-retCh:
@@ -871,13 +910,14 @@ func (s *Server) newClientSession(ctx context.Context, session *tpb.Session, add
 			return
 		}
 		go func() {
+			defer ioe.rwc.Close()
 			// If client is requesting a remote target, only call the bridge handler.
 			// We might extend it to allow calling the customized handler in the future.
 			var err error
 			tc := s.clientFromTarget(t)
 			switch {
 			case tc != nil:
-				err = s.bridgeHandler(ServerSession{addr, t}, ioe.rwc)
+				err = s.bridgeHandler(ctx, ServerSession{addr, t}, ioe.rwc)
 			case s.sc.Handler != nil:
 				err = s.sc.Handler(ServerSession{addr, t}, ioe.rwc)
 			default:
@@ -912,7 +952,14 @@ func (s *Server) Tunnel(stream tpb.Tunnel_TunnelServer) error {
 		return errors.New("no connection associated with tag")
 	}
 	d := newIOStream(stream.Context(), stream)
-	ch <- ioOrErr{rwc: d}
+	// Deliver without blocking: the session waiter may have abandoned the
+	// channel after this handler looked it up. The channel is buffered, so a
+	// hit on the default case means another response already claimed it.
+	select {
+	case ch <- ioOrErr{rwc: d}:
+	default:
+		return fmt.Errorf("no receiver for tunnel stream with tag %d: session abandoned", tag)
+	}
 	// doneCh is the done channel created from a child context of stream.Context()
 	<-d.doneCh
 	return nil
@@ -1007,7 +1054,7 @@ func (c *Client) deletePeerTarget(t *tpb.Target) error {
 	c.pmu.Lock()
 	defer c.pmu.Unlock()
 
-	if _, ok := c.peerTypeTargets[t.TargetType]; !ok {
+	if _, ok := c.peerTypeTargets[t.TargetType]; ok {
 		delete(c.peerTypeTargets[t.TargetType], Target{ID: t.Target, Type: t.TargetType})
 	}
 	if c.cc.PeerDelHandler != nil {
@@ -1076,15 +1123,15 @@ func (s *Server) NewSession(ctx context.Context, ss ServerSession) (io.ReadWrite
 }
 
 func (s *Server) handleSession(ctx context.Context, tag int32, addr net.Addr, target Target, stream regStream) (_ io.ReadWriteCloser, err error) {
-	retCh := make(chan ioOrErr)
+	// Buffered so a response delivered after this function abandons the wait
+	// below (ctx canceled) never blocks the sender. The sender is the
+	// client's Register goroutine, and blocking it permanently leaks the
+	// client's target registrations even after the connection dies.
+	retCh := make(chan ioOrErr, 1)
 	if err = s.addConnection(tag, addr, retCh); err != nil {
 		return nil, fmt.Errorf("handleSession: failed to add connection: %v", err)
 	}
-	defer func() {
-		if err != nil {
-			s.deleteConnection(tag, addr)
-		}
-	}()
+	defer s.deleteConnection(tag, addr)
 
 	if err = stream.Send(&tpb.RegisterOp{Registration: &tpb.RegisterOp_Session{Session: &tpb.Session{
 		Tag:        tag,
@@ -1096,6 +1143,18 @@ func (s *Server) handleSession(ctx context.Context, tag int32, addr net.Addr, ta
 	}
 	select {
 	case <-ctx.Done():
+		// Remove the connection so no new sender can pick it up, then drain a
+		// response that may already be buffered so its tunnel stream is
+		// released rather than leaked. The deferred deleteConnection is then
+		// a no-op.
+		s.deleteConnection(tag, addr)
+		select {
+		case ioe := <-retCh:
+			if ioe.rwc != nil {
+				ioe.rwc.Close()
+			}
+		default:
+		}
 		return nil, ctx.Err()
 	case ioe := <-retCh:
 		if ioe.err != nil {
@@ -1138,6 +1197,7 @@ type Client struct {
 	cmu  sync.RWMutex
 	rs   *regSafeStream
 	addr net.Addr // peer address to use in endpoint map
+	ctx  context.Context
 
 	targets map[Target]struct{}
 
@@ -1152,15 +1212,16 @@ type Client struct {
 // cancel performs cancellations of Start() and streamHandler(), and records error.
 func (c *Client) cancel(err error) {
 	c.emu.Lock()
-	defer c.emu.Unlock()
 	// Avoid calling multiple times.
 	if c.cancelFunc == nil {
+		c.emu.Unlock()
 		return
 	}
-
-	c.cancelFunc()
+	cancel := c.cancelFunc
 	c.cancelFunc = nil
 	c.err = err
+	c.emu.Unlock()
+	cancel()
 }
 
 // Error returns the error collected from streamHandler.
@@ -1198,59 +1259,111 @@ func NewClient(tc tpb.TunnelClient, cc ClientConfig, ts map[Target]struct{}) (*C
 
 // NewSession requests a new stream identified on the server side by target.
 func (c *Client) NewSession(target Target) (_ io.ReadWriteCloser, err error) {
+	return c.NewSessionContext(context.Background(), target)
+}
+
+// NewSessionContext requests a new stream and abandons the request when ctx or
+// the active registration context is canceled.
+func (c *Client) NewSessionContext(ctx context.Context, target Target) (_ io.ReadWriteCloser, err error) {
 	c.cmu.RLock()
-	defer c.cmu.RUnlock()
-	if c.addr == nil {
+	addr, rs, registerCtx := c.addr, c.rs, c.ctx
+	c.cmu.RUnlock()
+	if addr == nil || rs == nil || registerCtx == nil {
 		return nil, errors.New("client not started")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := registerCtx.Err(); err != nil {
+		return nil, err
 	}
 	retCh := make(chan ioOrErr, 1)
 	tag := c.nextTag()
-	if err = c.addConnection(tag, c.addr, retCh); err != nil {
+	if err = c.addConnection(tag, addr, retCh); err != nil {
 		return nil, err
 	}
-	defer func() {
-		if err != nil {
-			c.deleteConnection(tag, c.addr)
-		}
-	}()
-	if err = c.rs.Send(&tpb.RegisterOp{Registration: &tpb.RegisterOp_Session{Session: &tpb.Session{
+	defer c.deleteConnection(tag, addr)
+	if err = rs.Send(&tpb.RegisterOp{Registration: &tpb.RegisterOp_Session{Session: &tpb.Session{
 		Tag:        tag,
 		Target:     target.ID,
 		TargetType: target.Type,
 	}}}); err != nil {
 		return nil, err
 	}
-	ioe := <-retCh
-	if ioe.err != nil {
-		return nil, ioe.err
+	var cancelErr error
+	select {
+	case <-ctx.Done():
+		cancelErr = ctx.Err()
+	case <-registerCtx.Done():
+		cancelErr = registerCtx.Err()
+	case ioe := <-retCh:
+		if ioe.err != nil {
+			return nil, ioe.err
+		}
+		return ioe.rwc, nil
 	}
-	return ioe.rwc, nil
+	// Prevent a racing returnedStream from delivering after this request has
+	// been abandoned. If it already won that race, close the buffered stream.
+	c.deleteConnection(tag, addr)
+	select {
+	case ioe := <-retCh:
+		if ioe.rwc != nil {
+			_ = ioe.rwc.Close()
+		}
+	default:
+	}
+	return nil, cancelErr
 }
 
 // Register initializes the client register stream and determines the
 // capabilities of the tunnel server.
 func (c *Client) Register(ctx context.Context) (err error) {
-	c.cmu.Lock()
-	defer c.cmu.Unlock()
+	ctx, cancel := context.WithCancel(ctx)
+	c.emu.Lock()
+	c.cancelFunc = cancel
+	c.err = nil
+	c.emu.Unlock()
+	defer func() {
+		if err != nil {
+			c.cancel(err)
+		}
+	}()
 
-	ctx, c.cancelFunc = context.WithCancel(ctx)
 	stream, err := c.tc.Register(ctx, c.cc.Opts...)
 	if err != nil {
 		return fmt.Errorf("start: failed to create register stream: %v", err)
 	}
-	c.rs = &regSafeStream{regStream: stream}
 	p, ok := peer.FromContext(stream.Context())
 	if !ok {
 		return errors.New("no peer from stream context")
 	}
+	rs := &regSafeStream{regStream: stream}
+	c.cmu.Lock()
+	c.ctx = ctx
+	c.rs = rs
 	c.addr = p.Addr
+	c.cmu.Unlock()
 
 	for target := range c.targets {
-		c.NewTarget(target)
+		if err := rs.Send(&tpb.RegisterOp{Registration: &tpb.RegisterOp_Target{Target: &tpb.Target{
+			Target:     target.ID,
+			Op:         tpb.Target_ADD,
+			TargetType: target.Type,
+		}}}); err != nil {
+			return fmt.Errorf("failed to register target %q: %v", target.ID, err)
+		}
 	}
 
+	c.pmu.RLock()
+	subscriptions := make([]string, 0, len(c.peerTypeTargets))
 	for typ := range c.peerTypeTargets {
-		c.Subscribe(typ)
+		subscriptions = append(subscriptions, typ)
+	}
+	c.pmu.RUnlock()
+	for _, typ := range subscriptions {
+		if err := c.Subscribe(typ); err != nil {
+			return fmt.Errorf("failed to subscribe to target type %q: %v", typ, err)
+		}
 	}
 
 	return nil
@@ -1270,23 +1383,35 @@ func (c *Client) Run(ctx context.Context) error {
 // Start handles received register stream requests.
 func (c *Client) Start(ctx context.Context) {
 	var err error
-	defer func() {
-		c.cancel(err)
-	}()
-
 	select {
 	case c.block <- struct{}{}:
 		defer func() {
 			<-c.block
 		}()
 	default:
-		err = errors.New("client is already running")
+		c.emu.Lock()
+		c.err = errors.New("client is already running")
+		c.emu.Unlock()
 		return
 	}
+	defer func() {
+		c.cancel(err)
+	}()
+	c.cmu.RLock()
+	registerCtx, rs := c.ctx, c.rs
+	c.cmu.RUnlock()
+	if registerCtx == nil || rs == nil {
+		err = errors.New("client not registered")
+		return
+	}
+	handlerCtx, cancelHandlers := context.WithCancel(registerCtx)
+	stopCancel := context.AfterFunc(ctx, cancelHandlers)
+	defer stopCancel()
+	defer cancelHandlers()
 
 	for {
 		var reg *tpb.RegisterOp
-		reg, err = c.rs.Recv()
+		reg, err = rs.Recv()
 		if err != nil {
 			return
 		}
@@ -1302,7 +1427,7 @@ func (c *Client) Start(ctx context.Context) {
 			tID := session.GetTarget()
 			tType := session.GetTargetType()
 			go func() {
-				if err := c.streamHandler(ctx, tag, Target{ID: tID, Type: tType}); err != nil {
+				if err := c.streamHandler(handlerCtx, tag, Target{ID: tID, Type: tType}); err != nil {
 					c.cancel(err)
 				}
 			}()
@@ -1377,21 +1502,35 @@ func (c *Client) streamHandler(ctx context.Context, tag int32, t Target) (e erro
 // A tag which is less than 0 indicates the stream originated at the client.
 func (c *Client) returnedStream(ctx context.Context, tag int32) (err error) {
 	c.cmu.RLock()
-	defer c.cmu.RUnlock()
-	ch := c.connection(tag, c.addr)
+	addr, rs := c.addr, c.rs
+	c.cmu.RUnlock()
+	ch := c.connection(tag, addr)
 	if ch == nil {
-		return fmt.Errorf("No connection associated with tag: %d", tag)
+		if rs == nil {
+			return fmt.Errorf("no connection associated with tag: %d", tag)
+		}
+		return rs.Send(&tpb.RegisterOp{Registration: &tpb.RegisterOp_Session{Session: &tpb.Session{
+			Tag:   tag,
+			Error: fmt.Sprintf("no connection associated with tag: %d", tag),
+		}}})
 	}
-	// notify client session of error, and return error to be sent to server.
-	var rwc io.ReadWriteCloser
-	defer func() {
-		ch <- ioOrErr{rwc: rwc, err: err}
-	}()
-	rwc, err = c.newTunnelStream(ctx, tag)
+	rwc, err := c.newTunnelStream(ctx, tag)
 	if err != nil {
+		select {
+		case ch <- ioOrErr{err: err}:
+		default:
+		}
 		return err
 	}
-	return nil
+	if c.connection(tag, addr) != ch {
+		return rwc.Close()
+	}
+	select {
+	case ch <- ioOrErr{rwc: rwc}:
+		return nil
+	default:
+		return rwc.Close()
+	}
 }
 
 // handleNewClientStream is called when the tag is greater than 0, and the client
@@ -1401,6 +1540,7 @@ func (c *Client) newClientStream(ctx context.Context, tag int32, t Target) error
 	if err != nil {
 		return err
 	}
+	defer stream.Close()
 	if c.cc.Handler == nil {
 		return fmt.Errorf("no Handler provided")
 	}
@@ -1410,12 +1550,15 @@ func (c *Client) newClientStream(ctx context.Context, tag int32, t Target) error
 // newTunnelStream creates a new tunnel stream and sends tag to the server. The
 // server uses this tag to uniquely identify the connection.
 func (c *Client) newTunnelStream(ctx context.Context, tag int32) (*ioStream, error) {
-	ts, err := c.tc.Tunnel(ctx, c.cc.Opts...)
+	streamCtx, cancel := context.WithCancel(ctx)
+	ts, err := c.tc.Tunnel(streamCtx, c.cc.Opts...)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	if err = ts.Send(&tpb.Data{Tag: tag}); err != nil {
+		cancel()
 		return nil, err
 	}
-	return newIOStream(ctx, ts), nil
+	return newIOStreamWithCancel(streamCtx, ts, cancel), nil
 }
