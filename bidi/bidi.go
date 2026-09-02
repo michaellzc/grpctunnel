@@ -18,11 +18,29 @@
 package bidi
 
 import (
+	"errors"
 	"io"
+	"net"
+	"syscall"
 )
 
 type closeWriter interface {
 	CloseWrite() error
+}
+
+// isSpentConn reports whether err describes a connection that is already
+// finished rather than one that failed.
+//
+// shutdown(2) on a socket whose peer has already gone returns ENOTCONN, and a
+// write side that is already torn down returns EPIPE. Both mean the half-close
+// this code was about to perform has effectively happened. Treating either as a
+// terminal error tears down the opposite direction while it is still copying,
+// which truncates the stream and surfaces to the far end as an abrupt
+// disconnect - for a TLS stream, "unexpected eof while reading".
+func isSpentConn(err error) bool {
+	return errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ENOTCONN) ||
+		errors.Is(err, syscall.EPIPE)
 }
 
 // Copy starts bi-directional copying between two read write closers.
@@ -36,6 +54,12 @@ func Copy(i, j io.ReadWriteCloser) error {
 				err = w.CloseWrite()
 			} else {
 				err = dst.Close()
+			}
+			// The read side ended cleanly, so a close that reports the peer is
+			// already gone still leaves this direction complete. Report success
+			// and let the opposite direction finish on its own terms.
+			if isSpentConn(err) {
+				err = nil
 			}
 		}
 		errCh <- err
