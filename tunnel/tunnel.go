@@ -878,7 +878,6 @@ func (s *Server) newClientSession(ctx context.Context, session *tpb.Session, add
 		}
 		return
 	}
-	defer s.deleteConnection(tag, addr)
 
 	if err := rs.Send(&tpb.RegisterOp{Registration: &tpb.RegisterOp_Session{Session: &tpb.Session{
 		Tag:        session.Tag,
@@ -886,49 +885,56 @@ func (s *Server) newClientSession(ctx context.Context, session *tpb.Session, add
 		Target:     session.Target,
 		TargetType: session.TargetType,
 	}}}); err != nil {
+		s.deleteConnection(tag, addr)
 		s.sendError(fmt.Errorf("failed to send session ack: %v", err))
 		return
 	}
-	// ctx is a child of the register stream's context
-	select {
-	case <-ctx.Done():
-		// Remove the connection so no new sender can pick it up, then drain a
-		// response that may already be buffered so its tunnel stream is
-		// released rather than leaked.
-		s.deleteConnection(tag, addr)
+	// Keep receiving registration messages while waiting for the Tunnel RPC.
+	// A client that canceled before our ACK sends its session error on Register;
+	// waiting here synchronously would prevent us from ever reading that error.
+	go func() {
+		defer s.deleteConnection(tag, addr)
+		// ctx is a child of the register stream's context
 		select {
-		case ioe := <-retCh:
-			if ioe.rwc != nil {
-				ioe.rwc.Close()
-			}
-		default:
-		}
-		s.sendError(ctx.Err())
-		return
-	case ioe := <-retCh:
-		if ioe.err != nil {
-			return
-		}
-		go func() {
-			defer ioe.rwc.Close()
-			// If client is requesting a remote target, only call the bridge handler.
-			// We might extend it to allow calling the customized handler in the future.
-			var err error
-			tc := s.clientFromTarget(t)
-			switch {
-			case tc != nil:
-				err = s.bridgeHandler(ctx, ServerSession{addr, t}, ioe.rwc)
-			case s.sc.Handler != nil:
-				err = s.sc.Handler(ServerSession{addr, t}, ioe.rwc)
+		case <-ctx.Done():
+			// Remove the connection so no new sender can pick it up, then drain a
+			// response that may already be buffered so its tunnel stream is
+			// released rather than leaked.
+			s.deleteConnection(tag, addr)
+			select {
+			case ioe := <-retCh:
+				if ioe.rwc != nil {
+					ioe.rwc.Close()
+				}
 			default:
-				err = fmt.Errorf("no target %q of type %q registered", session.Target, session.TargetType)
 			}
-			if err != nil {
-				s.sendError(err)
-			}
+			s.sendError(ctx.Err())
 			return
-		}()
-	}
+		case ioe := <-retCh:
+			if ioe.err != nil {
+				return
+			}
+			go func() {
+				defer ioe.rwc.Close()
+				// If client is requesting a remote target, only call the bridge handler.
+				// We might extend it to allow calling the customized handler in the future.
+				var err error
+				tc := s.clientFromTarget(t)
+				switch {
+				case tc != nil:
+					err = s.bridgeHandler(ctx, ServerSession{addr, t}, ioe.rwc)
+				case s.sc.Handler != nil:
+					err = s.sc.Handler(ServerSession{addr, t}, ioe.rwc)
+				default:
+					err = fmt.Errorf("no target %q of type %q registered", session.Target, session.TargetType)
+				}
+				if err != nil {
+					s.sendError(err)
+				}
+				return
+			}()
+		}
+	}()
 }
 
 // Tunnel accepts tunnel connections from the client. When it accepts a stream,
