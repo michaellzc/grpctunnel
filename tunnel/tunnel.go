@@ -386,6 +386,13 @@ func (s *Server) addClient(addr net.Addr, rs regStream) error {
 
 // deleteClient removes a client from the clients map, and delete the corresponding targets from the targets map.
 func (s *Server) deleteClient(addr net.Addr) {
+	// Drop the client's subscriptions too. Otherwise a client that registers again
+	// from the same address, such as on the same gRPC connection, has its
+	// subscription rejected as already subscribed.
+	s.smu.Lock()
+	delete(s.sub, addr)
+	s.smu.Unlock()
+
 	s.cmu.Lock()
 	defer s.cmu.Unlock()
 	clientInfo, ok := s.clients[addr]

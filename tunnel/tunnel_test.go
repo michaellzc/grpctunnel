@@ -715,6 +715,53 @@ func TestServerRegister(t *testing.T) {
 	}
 }
 
+// A client that re-registers from the same address, as a gRPC client does when
+// it opens a new Register stream on the same connection, must be able to
+// subscribe again after its previous Register stream ended.
+func TestServerRegisterResubscribeAfterDisconnect(t *testing.T) {
+	addr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:45000")
+	if err != nil {
+		t.Fatalf("failed to resolve address: %v", err)
+	}
+	s, err := NewServer(ServerConfig{})
+	if err != nil {
+		t.Fatalf("NewServer(ServerConfig{}) failed: %v", err)
+	}
+	subscribe := func() *registerTestStream {
+		stream := &registerTestStream{
+			ctx:      peer.NewContext(context.Background(), &peer.Peer{Addr: addr}),
+			maxSends: 10,
+			streamRecv: []*tpb.RegisterOp{{Registration: &tpb.RegisterOp_Subscription{Subscription: &tpb.Subscription{
+				Op:         tpb.Subscription_SUBCRIBE,
+				TargetType: tpb.TargetType_UNKNOWN.String(),
+			}}}},
+		}
+		// Recv fails once the subscription is consumed, ending the stream.
+		if err := s.Register(stream); !errors.Is(err, errRead) {
+			t.Fatalf("Register() want %v, got %v", errRead, err)
+		}
+		return stream
+	}
+
+	subscribe()
+	stream := subscribe()
+
+	var accepted bool
+	for _, op := range stream.streamSend {
+		sub := op.GetSubscription()
+		if sub == nil {
+			continue
+		}
+		if sub.GetError() != "" {
+			t.Fatalf("second subscription got error %q, want it accepted", sub.GetError())
+		}
+		accepted = accepted || sub.GetAccept()
+	}
+	if !accepted {
+		t.Fatalf("second subscription was not accepted, sent ops: %v", stream.streamSend)
+	}
+}
+
 func TestServerTunnelError(t *testing.T) {
 	addr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:45000")
 	if err != nil {
